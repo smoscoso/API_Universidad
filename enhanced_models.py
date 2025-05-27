@@ -18,11 +18,11 @@ class EnhancedKNN:
         self.y_train = np.array(y, dtype=int)
         
         if self.k > len(self.X_train):
-            self.k = len(self.X_train)
+            self.k = max(1, len(self.X_train))
     
     def predict(self, X):
         """Realizar predicciones con pesos por distancia"""
-        if self.X_train is None:
+        if self.X_train is None or len(self.X_train) == 0:
             raise ValueError("El modelo no ha sido entrenado")
         
         X = np.array(X, dtype=float)
@@ -32,28 +32,35 @@ class EnhancedKNN:
             # Calcular distancias ponderadas
             distances = []
             for i, train_point in enumerate(self.X_train):
-                # Distancia euclidiana ponderada por el peso del BSSID
+                # Distancia euclidiana ponderada
                 bssid_weight = train_point[2] if len(train_point) > 2 else 1.0
-                dist = np.sqrt(np.sum((train_point[:2] - x[:2]) ** 2)) / (bssid_weight + 0.1)
-                distances.append((dist, i))
+                dist = np.sqrt(np.sum((train_point[:2] - x[:2]) ** 2))
+                weighted_dist = dist / (bssid_weight + 0.1)
+                distances.append((weighted_dist, i))
             
             # Obtener k vecinos más cercanos
             distances.sort()
-            k_neighbors = distances[:self.k]
+            k_neighbors = distances[:min(self.k, len(distances))]
             
-            if self.distance_weights:
+            if self.distance_weights and len(k_neighbors) > 0:
                 # Votación ponderada por distancia inversa
                 weighted_votes = defaultdict(float)
                 for dist, idx in k_neighbors:
                     label = self.y_train[idx]
-                    weight = 1.0 / (dist + 1e-8)  # Evitar división por cero
+                    weight = 1.0 / (dist + 1e-8)
                     weighted_votes[label] += weight
                 
-                predicted_label = max(weighted_votes, key=weighted_votes.get)
+                if weighted_votes:
+                    predicted_label = max(weighted_votes, key=weighted_votes.get)
+                else:
+                    predicted_label = self.y_train[0]
             else:
                 # Votación simple
-                k_labels = [self.y_train[idx] for _, idx in k_neighbors]
-                predicted_label = Counter(k_labels).most_common(1)[0][0]
+                if k_neighbors:
+                    k_labels = [self.y_train[idx] for _, idx in k_neighbors]
+                    predicted_label = Counter(k_labels).most_common(1)[0][0]
+                else:
+                    predicted_label = self.y_train[0]
             
             predictions.append(predicted_label)
         
@@ -61,17 +68,19 @@ class EnhancedKNN:
     
     def score(self, X, y):
         """Calcular precisión del modelo"""
-        if len(X) == 0:
+        if len(X) == 0 or len(y) == 0:
             return 0.0
-        predictions = self.predict(X)
-        return np.mean(predictions == y)
+        try:
+            predictions = self.predict(X)
+            return np.mean(predictions == y)
+        except Exception:
+            return 0.0
 
 class EnhancedRandomForest:
-    def __init__(self, n_trees=15, max_depth=8, min_samples_split=3, feature_subset=0.8):
+    def __init__(self, n_trees=15, max_depth=8, min_samples_split=3):
         self.n_trees = n_trees
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
-        self.feature_subset = feature_subset
         self.trees = []
         self.feature_indices = []
     
@@ -80,35 +89,42 @@ class EnhancedRandomForest:
         X = np.array(X, dtype=float)
         y = np.array(y, dtype=int)
         
+        if len(X) == 0:
+            return
+        
         self.trees = []
         self.feature_indices = []
         np.random.seed(42)
         
         n_features = X.shape[1]
-        n_features_subset = max(1, int(n_features * self.feature_subset))
         
         for i in range(self.n_trees):
-            # Bootstrap sampling
-            indices = np.random.choice(len(X), len(X), replace=True)
-            X_bootstrap = X[indices]
-            y_bootstrap = y[indices]
-            
-            # Feature subset selection
-            feature_idx = np.random.choice(n_features, n_features_subset, replace=False)
-            X_subset = X_bootstrap[:, feature_idx]
-            
-            # Entrenar árbol
-            tree = EnhancedDecisionTree(
-                max_depth=self.max_depth,
-                min_samples_split=self.min_samples_split
-            )
-            tree.fit(X_subset, y_bootstrap)
-            
-            self.trees.append(tree)
-            self.feature_indices.append(feature_idx)
+            try:
+                # Bootstrap sampling
+                indices = np.random.choice(len(X), len(X), replace=True)
+                X_bootstrap = X[indices]
+                y_bootstrap = y[indices]
+                
+                # Usar todas las características para datasets pequeños
+                feature_idx = np.arange(n_features)
+                X_subset = X_bootstrap[:, feature_idx]
+                
+                # Entrenar árbol
+                tree = EnhancedDecisionTree(
+                    max_depth=self.max_depth,
+                    min_samples_split=self.min_samples_split
+                )
+                tree.fit(X_subset, y_bootstrap)
+                
+                self.trees.append(tree)
+                self.feature_indices.append(feature_idx)
+                
+            except Exception as e:
+                logger.warning(f"Error entrenando árbol {i}: {e}")
+                continue
     
     def predict(self, X):
-        """Predicción con votación ponderada"""
+        """Predicción con votación mayoritaria"""
         if not self.trees:
             raise ValueError("El modelo no ha sido entrenado")
         
@@ -116,25 +132,38 @@ class EnhancedRandomForest:
         all_predictions = []
         
         for i, tree in enumerate(self.trees):
-            feature_idx = self.feature_indices[i]
-            X_subset = X[:, feature_idx]
-            predictions = tree.predict(X_subset)
-            all_predictions.append(predictions)
+            try:
+                feature_idx = self.feature_indices[i]
+                X_subset = X[:, feature_idx]
+                predictions = tree.predict(X_subset)
+                all_predictions.append(predictions)
+            except Exception as e:
+                logger.warning(f"Error en predicción del árbol {i}: {e}")
+                continue
+        
+        if not all_predictions:
+            return np.zeros(X.shape[0], dtype=int)
         
         # Votación mayoritaria
         final_predictions = []
         for i in range(X.shape[0]):
-            votes = [pred[i] for pred in all_predictions]
-            final_predictions.append(Counter(votes).most_common(1)[0][0])
+            votes = [pred[i] for pred in all_predictions if i < len(pred)]
+            if votes:
+                final_predictions.append(Counter(votes).most_common(1)[0][0])
+            else:
+                final_predictions.append(0)
         
         return np.array(final_predictions)
     
     def score(self, X, y):
         """Calcular precisión"""
-        if len(X) == 0:
+        if len(X) == 0 or len(y) == 0:
             return 0.0
-        predictions = self.predict(X)
-        return np.mean(predictions == y)
+        try:
+            predictions = self.predict(X)
+            return np.mean(predictions == y)
+        except Exception:
+            return 0.0
 
 class EnhancedDecisionTree:
     def __init__(self, max_depth=None, min_samples_split=2):
@@ -155,26 +184,13 @@ class EnhancedDecisionTree:
         probabilities = counts / len(y)
         return 1 - np.sum(probabilities ** 2)
     
-    def _information_gain(self, y, left_y, right_y):
-        """Calcular ganancia de información"""
-        n = len(y)
-        if n == 0:
-            return 0
-        
-        parent_gini = self._gini_impurity(y)
-        left_weight = len(left_y) / n
-        right_weight = len(right_y) / n
-        
-        weighted_gini = (left_weight * self._gini_impurity(left_y) + 
-                        right_weight * self._gini_impurity(right_y))
-        
-        return parent_gini - weighted_gini
-    
     def _best_split(self, X, y):
         """Encontrar la mejor división"""
         best_gain = 0
         best_feature = None
         best_threshold = None
+        
+        parent_gini = self._gini_impurity(y)
         
         for feature in range(X.shape[1]):
             thresholds = np.unique(X[:, feature])
@@ -183,10 +199,19 @@ class EnhancedDecisionTree:
                 left_mask = X[:, feature] <= threshold
                 right_mask = ~left_mask
                 
-                if np.sum(left_mask) < self.min_samples_split or np.sum(right_mask) < self.min_samples_split:
+                if (np.sum(left_mask) < self.min_samples_split or 
+                    np.sum(right_mask) < self.min_samples_split):
                     continue
                 
-                gain = self._information_gain(y, y[left_mask], y[right_mask])
+                # Calcular ganancia de información
+                left_gini = self._gini_impurity(y[left_mask])
+                right_gini = self._gini_impurity(y[right_mask])
+                
+                n = len(y)
+                weighted_gini = (np.sum(left_mask) * left_gini + 
+                               np.sum(right_mask) * right_gini) / n
+                
+                gain = parent_gini - weighted_gini
                 
                 if gain > best_gain:
                     best_gain = gain
@@ -203,8 +228,13 @@ class EnhancedDecisionTree:
         # Condiciones de parada
         if (len(y) < self.min_samples_split or 
             (self.max_depth and depth >= self.max_depth) or
-            len(np.unique(y)) == 1):
-            self.value = Counter(y).most_common(1)[0][0]
+            len(np.unique(y)) == 1 or
+            len(y) == 0):
+            
+            if len(y) > 0:
+                self.value = Counter(y).most_common(1)[0][0]
+            else:
+                self.value = 0
             self.is_leaf = True
             return
         
@@ -236,13 +266,15 @@ class EnhancedDecisionTree:
             return np.full(X.shape[0], self.value)
         
         predictions = np.zeros(X.shape[0], dtype=int)
-        left_mask = X[:, self.feature] <= self.threshold
-        right_mask = ~left_mask
         
-        if np.any(left_mask):
-            predictions[left_mask] = self.left.predict(X[left_mask])
-        if np.any(right_mask):
-            predictions[right_mask] = self.right.predict(X[right_mask])
+        if X.shape[0] > 0:
+            left_mask = X[:, self.feature] <= self.threshold
+            right_mask = ~left_mask
+            
+            if np.any(left_mask):
+                predictions[left_mask] = self.left.predict(X[left_mask])
+            if np.any(right_mask):
+                predictions[right_mask] = self.right.predict(X[right_mask])
         
         return predictions
 
@@ -250,10 +282,13 @@ class WiFiFingerprinting:
     def __init__(self, location_fingerprints: Dict, signal_stats: Dict):
         self.location_fingerprints = location_fingerprints
         self.signal_stats = signal_stats
-        self.accuracy = 0.85  # Precisión estimada basada en fingerprinting
+        self.accuracy = 0.85
     
     def predict_with_confidence(self, signal_data: Dict[str, int]) -> Tuple[int, float]:
         """Predicción con medida de confianza"""
+        if not self.location_fingerprints or not signal_data:
+            return 0, 0.0
+        
         location_scores = {}
         
         for location, fingerprint in self.location_fingerprints.items():
@@ -267,22 +302,28 @@ class WiFiFingerprinting:
         best_location = max(location_scores, key=location_scores.get)
         best_score = location_scores[best_location]
         
-        # Calcular confianza basada en la diferencia con la segunda mejor
+        # Calcular confianza
         sorted_scores = sorted(location_scores.values(), reverse=True)
-        if len(sorted_scores) > 1:
-            confidence = (sorted_scores[0] - sorted_scores[1]) / sorted_scores[0]
+        if len(sorted_scores) > 1 and sorted_scores[0] > 0:
+            confidence = min((sorted_scores[0] - sorted_scores[1]) / sorted_scores[0], 1.0)
         else:
             confidence = best_score
         
         # Mapear ubicación a índice
-        location_mapping = {loc: i for i, loc in enumerate(self.location_fingerprints.keys())}
-        location_idx = location_mapping.get(best_location, 0)
+        location_list = list(self.location_fingerprints.keys())
+        try:
+            location_idx = location_list.index(best_location)
+        except ValueError:
+            location_idx = 0
         
-        return location_idx, min(confidence, 1.0)
+        return location_idx, max(0.0, min(confidence, 1.0))
     
     def _calculate_similarity_score(self, observed_signals: Dict[str, int], 
                                   fingerprint: Dict[str, Dict]) -> float:
-        """Calcular score de similitud entre señales observadas y fingerprint"""
+        """Calcular score de similitud"""
+        if not observed_signals or not fingerprint:
+            return 0.0
+        
         total_score = 0.0
         matched_bssids = 0
         
@@ -292,13 +333,13 @@ class WiFiFingerprinting:
                 
                 # Score basado en proximidad a la media
                 mean_signal = fp_stats['mean']
-                std_signal = fp_stats['std'] if fp_stats['std'] > 0 else 5.0
+                std_signal = max(fp_stats['std'], 1.0)
                 
                 # Calcular score gaussiano
                 diff = abs(observed_signal - mean_signal)
                 gaussian_score = np.exp(-(diff ** 2) / (2 * std_signal ** 2))
                 
-                # Ponderar por frecuencia de aparición
+                # Ponderar por frecuencia
                 frequency_weight = min(fp_stats['count'] / 10.0, 1.0)
                 
                 total_score += gaussian_score * frequency_weight
@@ -307,22 +348,20 @@ class WiFiFingerprinting:
         if matched_bssids == 0:
             return 0.0
         
-        # Normalizar por número de BSSIDs coincidentes
+        # Normalizar
         normalized_score = total_score / matched_bssids
         
-        # Bonus por número de BSSIDs coincidentes
-        coverage_bonus = min(matched_bssids / 5.0, 1.0)
+        # Bonus por cobertura
+        coverage_bonus = min(matched_bssids / 3.0, 1.0)
         
         return normalized_score * coverage_bonus
     
     def get_accuracy(self) -> float:
-        """Obtener precisión estimada del modelo"""
+        """Obtener precisión estimada"""
         return self.accuracy
     
     def predict(self, X):
-        """Método de compatibilidad para interfaz estándar"""
-        # Este método es para compatibilidad, pero fingerprinting
-        # funciona mejor con el método predict_with_confidence
+        """Método de compatibilidad"""
         return np.array([0] * len(X))
     
     def score(self, X, y):
